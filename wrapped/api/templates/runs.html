@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+{% block title %}Runs · Wrapped{% endblock %}
+{% block content %}
+<h1>Runs</h1>
+<p>{{ health.total_runs }} runs · {{ health.running }} running · {{ health.failures_7d }} failures in the last 7 days</p>
+<table>
+  <caption>Most recent runs</caption>
+  <thead><tr><th>Run</th><th>User ID</th><th>Job</th><th>Status</th><th>Pages</th><th>Fetched</th><th>Inserted</th><th>Error type</th></tr></thead>
+  <tbody>{% for run in runs %}<tr><td><a href="/logs?run_id={{ run.id }}">{{ run.id }}</a></td><td>{{ run.user_id if run.user_id is not none else '' }}</td><td>{{ run.kind }}</td><td>{{ run.status }}</td><td>{{ run.pages }}</td><td>{{ run.fetched }}</td><td>{{ run.inserted }}</td><td>{{ run.error or '' }}</td></tr>{% else %}<tr><td colspan="8">No runs yet.</td></tr>{% endfor %}</tbody>
+</table>
+{% endblock %}

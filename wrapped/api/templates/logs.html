@@ -1,0 +1,16 @@
+{% extends "base.html" %}
+{% block title %}Application logs · Wrapped{% endblock %}
+{% block content %}
+<h1>Application logs</h1>
+<form method="get" action="/logs">
+  <label>Source <select name="source">{% for value in ['jobs', 'web'] %}<option{% if source == value %} selected{% endif %}>{{ value }}</option>{% endfor %}</select></label>
+  <label>Lines <input type="number" name="limit" min="1" max="2000" value="{{ limit }}"></label>
+  <label>Level <select name="level"><option value="">All</option>{% for value in ['DEBUG', 'INFO', 'WARNING', 'ERROR', 'CRITICAL'] %}<option{% if level == value %} selected{% endif %}>{{ value }}</option>{% endfor %}</select></label>
+  <label>Job <input name="job" value="{{ job or '' }}"></label>
+  <label>User ID <input name="user" value="{{ user or '' }}"></label>
+  <label>Run <input name="run_id" value="{{ run_id or '' }}"></label>
+  <button type="submit">Filter</button>
+</form>
+<p>Showing matching entries from the last {{ limit }} lines of {{ source }}.log, oldest first.</p>
+{% for record in records %}<pre>{{ record | tojson(indent=2) }}</pre>{% else %}<p>No matching log entries.</p>{% endfor %}
+{% endblock %}
