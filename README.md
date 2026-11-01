@@ -1,69 +1,67 @@
 # Wrapped
 
-A personal listening wrap from Last.fm scrobbles.
+Self-hosted listening analytics and monthly reports.
 
-## Run locally
+Wrapped collects listening history from enrollment onward and turns it into monthly reports with rankings, listening patterns, and fact-based narration. Reports are delivered through Telegram or email. An administrator manages enrollment, collection, and delivery through a web dashboard. Annual reports reuse the same analytics engine.
 
-```sh
-uv sync --extra dev
-cp .env.example .env
-# Set OWNER_USERNAME and OWNER_PASSWORD in .env before starting the dashboard.
-uv run wrapped check
-uv run uvicorn wrapped.api.app:app --host 127.0.0.1 --port 8000 --workers 1 --no-access-log
+**Status: under development.** Last.fm enrollment and incremental collection are implemented. Analytics are in progress. Report generation, report delivery, AI narration, and dashboard management are incomplete.
+
+## Planned features
+
+- Monthly and annual reports covering top artists, tracks, albums, discoveries, listening patterns, streaks, and period comparisons.
+- AI narration constrained to computed facts, with grounding validation and deterministic fallback text.
+- Telegram and email delivery with duplicate-send protection.
+- Administrator dashboard for user management, sync monitoring, data inspection, report previews, and delivery controls.
+- Scheduled collection, durable run records, failure alerts, backups, and restore procedures.
+- Future visual and video formats generated from the same report facts.
+
+This is an independent project, not an official Spotify or Apple product. Direct integrations with those services are research and future development work, subject to data capabilities, access, and permitted use. Last.fm is the only implemented listening source today.
+
+## Collection and report rules
+
+Collection starts when a person joins. Wrapped never imports pre-enrollment plays, even when a source returns them. Catching up on missed plays recorded after enrollment is allowed.
+
+Reports use local calendar periods and require at least **15 elapsed days of enrollment within the period**. Collection starts immediately; eligibility only controls reporting. Eligible first periods are labelled partial. An ineligible period produces no report or delivery. A quiet eligible period receives a short deterministic message rather than an AI-generated story.
+
+Names are normalized for comparison while their original spelling remains available for display. Re-fetching the same observation does not create another play. Playing the same song again at a different timestamp does.
+
+Wrapped distinguishes recorded plays, calculated facts, estimates, and missing data. A song's catalog length is not measured listening time. Global fan percentiles, listening age, mood, or audio characteristics are not inferred from data that cannot support them. See the [product decisions and metric definitions](docs/product-decisions.md).
+
+## Architecture
+
+```text
+Selected listening source
+        ↓
+Provider client → response validation and mapping
+        ↓
+Enrollment-bounded sync → SQLite events and checkpoint
+        ↓
+Deterministic metrics → selected facts → validated narration
+        ↓
+Report rendering → Telegram / email / future visual formats
+
+Admin dashboard and scheduler → shared service actions
+Run records / JSON logs / failure alerts → operational visibility
 ```
 
-The owner login protects `/`, `/runs`, `/logs`, and `/health` using HTTP Basic authentication. Use the loopback address through an SSH tunnel, or put a TLS reverse proxy in front of it. API docs are disabled. There are no mutation routes yet.
+The current implementation uses Python 3.12+, requests, Pydantic, SQLite, FastAPI, and Jinja2. The deployment plan uses a single web worker and serialized writer jobs on a persistent volume. The CLI serves scheduling and troubleshooting; the web dashboard is the intended daily admin interface.
 
-## Logs, run records, and alerts
+## Roadmap
 
-`configure_logging()` runs only at CLI entry and ASGI startup. Library code only calls `logging.getLogger(__name__)`. Logs are JSON lines with UTC timestamps, levels, logger names, stable event names, and `job`, `run_id`, and `user` context. `user` is the internal registry ID. Default level is INFO; DEBUG is opt-in with `LOG_LEVEL=DEBUG`.
+Current milestone: **P4 — analytics**. Automated acceptance coverage remains incomplete.
 
-- INFO: job start/finish and counts.
-- WARNING: retries, skipped-row page summaries, and alert delivery trouble.
-- ERROR: a failed job.
-- CRITICAL: rejected Last.fm credentials or an unusable database.
+- **P0–P1: foundations and Last.fm research.** Packaging, development checks, CI configuration, captured-response research; some research questions remain open.
+- **P2–P3: client, mapping, storage, and sync.** Functional Last.fm ingestion, normalization, enrollment boundaries, duplicate protection, migrations, and transactional run outcomes. Dedicated ingestion regression coverage remains outstanding.
+- **P4: analytics — current feature work.** Periods, eligibility, counts and rankings are underway; complete metrics, report assembly, and preview remain.
+- **P5–P6: delivery and narration.** Actual report delivery, duplicate-send protection, structured narration, validation, and evaluation. Owner failure alerts already exist.
+- **P7: complete the dashboard.** Authentication, runs, logs, and basic health exist; user management, report previews, sync actions, and Telegram linking remain.
+- **P8–P10: deployment, email, onboarding, and release preparation.** Scheduling, backups, restore verification, email, onboarding, and a synthetic demo. Container files are currently placeholders.
+- **Future extensions:** video presentation and viable, permitted Spotify and Apple Music adapters. Provider research can proceed in parallel; production enablement is a separate integration milestone.
 
-Files live under `WRAPPED_DATA_DIR/logs`: `web.log` and `jobs.log`, each rotating at 5 MiB with five backups. Run exactly one uvicorn worker. All cron invocations must use the same data volume and `jobs.lock`; the CLI takes its nonblocking `flock` before constructing its file handler. An overlapping invocation exits successfully with a skip message and creates no run record. Never remove the lock file while the app is running. A web-triggered job must use the same lock and stays in `web.log` because it runs in the web process.
+## Documentation
 
-The `/logs` viewer and `wrapped logs` read only those two active files. They inspect the last N physical lines (maximum 2,000), skip malformed, oversized, and unterminated entries, and support exact level, job, user, and run filters. The scan is bounded to 10 MiB. Archived rotation files are available over SSH. Templates autoescape; JSON displayed in HTML also escapes HTML characters.
-
-```sh
-uv run wrapped logs --source jobs --level WARNING --job sync --user 4 --run-id 7
-```
-
-`/runs` and `/health` read SQLite's `runs` table, independently of log contents. Run errors and alert messages contain exception types, never exception messages. Set both `TELEGRAM_TOKEN` and `TELEGRAM_OWNER_CHAT_ID` to enable owner failure alerts. An alert outage produces a warning and preserves the original job failure. Missing alert configuration produces a warning on a failed job.
-
-API keys, bot tokens, SMTP credentials, the configured owner chat ID, and the owner password are registered for exact-value redaction at startup, including exception text. Redaction is a safety net: application call sites must never log artist, track, or album names, full URLs, email addresses, or chat IDs. Use static messages and operational fields; arbitrary extra fields and domain objects are not serialized.
-
-## Using the job runner
-
-Use a dedicated run-record connection, separate from the transaction that writes application data. The body commits or rolls back its application work before returning. The context manager acquires the shared job lock, writes the running row, adds context to all nested library logs, finalizes counts/status, and sends a Telegram alert if the body fails. It reraises the original exception.
-
-```python
-from contextlib import closing
-from wrapped.db.store import connect
-from wrapped.services.alerts import TelegramAlert
-from wrapped.services.jobs import job
-
-with closing(connect(settings.database_path)) as runs_db:
-    with job(
-        "sync", db=runs_db, lock_path=settings.job_lock_path, user_id=user.id,
-        alert=TelegramAlert(settings.telegram_token, settings.telegram_owner_chat_id),
-    ) as run:
-        # Fetch and commit using a separate application-data connection here.
-        run.pages = result.pages
-        run.fetched = len(result.scrobbles)
-        run.inserted = inserted_count
-```
-
-For new CLI jobs, retain the CLI's outer lock through logging setup, database startup, and the final record/alert; pass its `held_lock` into `job()` to avoid acquiring the same lock twice. `wrapped check` demonstrates this with an actual SQLite quick check. Interrupted processes may leave a `running` record; this change does not automatically classify stale runs.
-
-## Verify
-
-```sh
-uv run ruff check .
-uv run mypy wrapped
-uv run pytest -q
-```
-
-Tests use temporary files/databases and mocked HTTP; they do not call Last.fm or Telegram.
+- [Development and operations](docs/development.md): local setup, enrollment and sync commands, logging, run records, and verification.
+- [Contributor guide](CONTRIBUTING.md): branches, PRs, review expectations, and checks.
+- [Spotify and Apple Music integration handoff](docs/provider-integration-handoff.md): assignment, architecture, authentication, errors, coverage, tests, and delivery sequence.
+- [Product decisions](docs/product-decisions.md): accepted definitions, proposals, limitations, and unresolved choices.
+- [Last.fm spike notes](docs/lastfm-spike.md): existing provider observations and open research questions.
