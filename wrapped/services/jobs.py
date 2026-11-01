@@ -22,6 +22,10 @@ class JobAlreadyRunning(RuntimeError):
     """Another process holds the shared writer lock; skip this invocation."""
 
 
+class JobCompletionError(RuntimeError):
+    """Normal completion handling failed or the outcome is uncertain."""
+
+
 @dataclass
 class _HeldLock:
     path: Path
@@ -31,10 +35,6 @@ class _HeldLock:
 
 @contextmanager
 def job_lock(path: Path) -> Iterator[_HeldLock]:
-    """A nonblocking flock on the shared volume, held through final logs/alerts.
-
-    Never unlink this file: waiters must keep locking the same inode.
-    """
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as handle:
         try:
@@ -68,6 +68,18 @@ class JobRun:
             raise ValueError("Run counts must be nonnegative integers")
         return values
 
+    def stage_success(self, db: sqlite3.Connection) -> None:
+        """Write success without commiting the caller's transaxtion"""
+        if self.id is None:
+            raise ValueError("Run has not started")
+
+        if not db.in_transaction:
+            raise ValueError("Success must be staged inside an active transaction")
+
+        self.counts()
+
+        _write_finish(db, self, status="success", error=None)
+
 
 def notify_failure(alert: Alert | None, message: str) -> None:
     if alert is None:
@@ -85,25 +97,63 @@ def notify_failure(alert: Alert | None, message: str) -> None:
         )
 
 
-def _finish(
+def _write_finish(
     db: sqlite3.Connection, run: JobRun, status: str, error: str | None
 ) -> None:
+    cursor = db.execute(
+        """
+        UPDATE runs
+        SET user_id = ?,
+            finished_at = ?,
+            pages = ?,
+            fetched = ?,
+            inserted = ?,
+            status = ?,
+            error = ?
+        WHERE id = ?
+        """,
+        (
+            run.user_id,
+            int(time.time()),
+            run.pages,
+            run.fetched,
+            run.inserted,
+            status,
+            error,
+            run.id,
+        ),
+    )
+
+    if cursor.rowcount != 1:
+        raise sqlite3.DatabaseError("Run record could not be updated")
+
+
+def _finish(
+    db: sqlite3.Connection,
+    run: JobRun,
+    status: str,
+    error: str | None,
+) -> None:
     with db:
-        db.execute(
-            "UPDATE runs SET finished_at=?, pages=?, fetched=?, inserted=?, status=?, error=? WHERE id=?",
-            (
-                int(time.time()),
-                run.pages,
-                run.fetched,
-                run.inserted,
-                status,
-                error,
-                run.id,
-            ),
-        )
+        _write_finish(db, run, status, error)
 
 
-@contextmanager
+def _run_status(
+    db: sqlite3.Connection,
+    run: JobRun,
+) -> str:
+    row = db.execute(
+        "SELECT status FROM runs WHERE id = ?",
+        (run.id,),
+    ).fetchone()
+
+    if row is None:
+        raise sqlite3.DatabaseError("Run record not found")
+
+    return row[0]
+
+
+@contextmanager  # pyright: ignore[reportDeprecated]
 def job(
     kind: str,
     *,
@@ -113,12 +163,7 @@ def job(
     alert: Alert | None = None,
     held_lock: _HeldLock | None = None,
 ) -> Iterator[JobRun]:
-    """Record one job independently of its application-data transaction.
-
-    The caller owns and commits/rolls back its work before leaving the body.
-    Use a connection without an active transaction for the run records. CLI
-    entrypoints may pass their already-held lock to cover logging startup too.
-    """
+    """Record one job independently of its application-data transaction."""
     if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", kind):
         raise ValueError("Invalid job kind")
     if db.in_transaction:
@@ -161,8 +206,14 @@ def job(
                     raise ValueError(
                         "Run-record connection has uncommitted application work"
                     )
-                run.counts()
-                _finish(db, run, "success", None)
+                _ = run.counts()
+                status = _run_status(db, run)
+
+                if status == "running":
+                    _finish(db, run, "success", None)
+                elif status != "success":
+                    raise sqlite3.DatabaseError("Unexpected run status")
+
                 log.info(
                     "Job finished",
                     extra={
@@ -174,21 +225,61 @@ def job(
                 )
         except BaseException as exc:
             with log_context(run_id=run.id):
+                commited = False
+
                 if run.id is not None:
                     try:
                         # Roll back unfinished work on this connection before recording failure.
                         db.rollback()
-                        _finish(db, run, "failed", type(exc).__name__)
+
+                        commited = _run_status(db, run) == "success"
+
+                        if not commited:
+                            _finish(db, run, "failed", type(exc).__name__)
+
                     except sqlite3.Error:
                         log.critical(
-                            "Cannot update run record",
-                            extra={"event": "job.record_failed"},
+                            "Job outcome could not be confirmed",
+                            extra={
+                                "event": "job.outcome_unknown",
+                                "exception_type": type(exc).__name__,
+                            },
                         )
+
+                        notify_failure(
+                            alert,
+                            f"Job {kind} outcome could not be confirmed (run {run.id})",
+                        )
+
+                        raise JobCompletionError(
+                            "Job outcome could not be confirmed; inspect the database"
+                        ) from None
+
+                if commited:
+                    log.critical(
+                        "Job commited but post-commit handling failed",
+                        extra={
+                            "event": "job.post_commit_failed",
+                            "status": "success",
+                            "exception_type": type(exc).__name__,
+                        },
+                    )
+                    notify_failure(
+                        alert,
+                        f"Job {kind} commited, but post-commit handling "
+                        f"failed (run {run.id}, {type(exc).__name__})",
+                    )
+
+                    raise JobCompletionError(
+                        "Job data commited; post-commit handling failed."
+                    ) from None
+
                 level = (
                     logging.CRITICAL
                     if isinstance(exc, (LastfmCredentialsError, sqlite3.Error))
                     else logging.ERROR
                 )
+
                 log.log(
                     level,
                     "Job failed",
@@ -198,7 +289,7 @@ def job(
                         "exception_type": type(exc).__name__,
                     },
                 )
-                # Never include an exception's message: it can contain URLs or listening data.
+
                 notify_failure(
                     alert, f"Job {kind} failed (run {run.id}, {type(exc).__name__})"
                 )

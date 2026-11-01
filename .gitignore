@@ -13,3 +13,10 @@ data/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+
+# Private Last.fm API captures
+/scripts/fixtures/
+
+# Local env variants and backups
+.env.*
+!.env.example

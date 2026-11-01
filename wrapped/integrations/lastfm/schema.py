@@ -74,7 +74,7 @@ def _is_now_playing(row: object) -> bool:
 
 class _RecentTracks(_Model):
     meta: _PageMeta = Field(alias="@attr")
-    rows: list[dict[str, Any]] = Field(default_factory=list, alias="track")
+    rows: list[object] = Field(default_factory=list, alias="track")
 
     @field_validator("rows", mode="before")
     @classmethod
@@ -118,6 +118,8 @@ def parse_page(payload: Any, username: str, page: int) -> ParsedPage:
         raise LastfmProtocolError("Last.fm returned a different page than requested")
     if recent.meta.total_pages == 0 and recent.rows:
         raise LastfmProtocolError("Last.fm returned scrobbles for zero pages")
+    if page <= recent.meta.total_pages and not recent.rows:
+        raise LastfmProtocolError("Last.fm returned no completed rows for a page")
 
     scrobbles: list[Scrobble] = []
     skipped = 0

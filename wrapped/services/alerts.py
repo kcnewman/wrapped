@@ -1,5 +1,3 @@
-"""Owner alerts are explicit job-runner calls, never logging handlers."""
-
 from __future__ import annotations
 
 import requests

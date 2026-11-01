@@ -1,5 +1,3 @@
-"""A bounded, tolerant reader over a fixed set of application log files."""
-
 from __future__ import annotations
 
 import json
